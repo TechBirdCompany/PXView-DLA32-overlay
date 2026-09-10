@@ -1,0 +1,407 @@
+diff --git a/src/hardware/fnirsi-dla32/protocol.h b/src/hardware/fnirsi-dla32/protocol.h
+new file mode 100644
+index 000000000..11d30d42e
+--- /dev/null
++++ b/src/hardware/fnirsi-dla32/protocol.h
+@@ -0,0 +1,27 @@
++#ifndef LIBSIGROK_HARDWARE_FNIRSI_DLA32_PROTOCOL_H
++#define LIBSIGROK_HARDWARE_FNIRSI_DLA32_PROTOCOL_H
++
++#include <stdint.h>
++#include <glib.h>
++#include <libsigrok/libsigrok.h>
++#include "libsigrok-internal.h"
++
++#define LOG_PREFIX "fnirsi-dla32"
++#define FNIRSI_DLA32_VID 0x0986
++#define FNIRSI_DLA32_PID 0x5537
++#define FNIRSI_DLA32_INTERFACE 0
++#define FNIRSI_DLA32_EP_OUT 0x02
++#define FNIRSI_DLA32_EP_IN 0x81
++#define FNIRSI_DLA32_COMMAND_SIZE 2040
++#define FNIRSI_DLA32_STREAM_SIZE 65500
++#define FNIRSI_DLA32_SAMPLERATE SR_MHZ(50)
++
++struct dev_context {
++    uint64_t samplerate;
++    uint64_t limit_samples;
++    gboolean abort_acquisition;
++};
++
++SR_PRIV int fnirsi_dla32_handle_events(int fd, int revents, void *cb_data);
++
++#endif
+diff --git a/src/hardware/fnirsi-dla32/api.c b/src/hardware/fnirsi-dla32/api.c
+new file mode 100644
+index 000000000..d499dc565
+--- /dev/null
++++ b/src/hardware/fnirsi-dla32/api.c
+@@ -0,0 +1,368 @@
++#include <config.h>
++#include <glib.h>
++#include <string.h>
++#include "protocol.h"
++
++static const uint32_t scanopts[] = {
++    SR_CONF_CONN,
++};
++
++static const uint32_t drvopts[] = {
++    SR_CONF_LOGIC_ANALYZER,
++};
++
++static const uint32_t devopts[] = {
++    SR_CONF_LIMIT_SAMPLES | SR_CONF_GET | SR_CONF_SET,
++    SR_CONF_SAMPLERATE | SR_CONF_GET | SR_CONF_SET | SR_CONF_LIST,
++    SR_CONF_CONN | SR_CONF_GET,
++};
++
++static const uint64_t samplerates[] = {
++    FNIRSI_DLA32_SAMPLERATE,
++};
++
++static const char *channel_names[] = {
++    "D0", "D1", "D2", "D3", "D4", "D5", "D6", "D7",
++    "D8", "D9", "D10", "D11", "D12", "D13", "D14", "D15",
++    "D16", "D17", "D18", "D19", "D20", "D21", "D22", "D23",
++    "D24", "D25", "D26", "D27", "D28", "D29", "D30", "D31",
++};
++
++static gboolean is_dla32(const struct libusb_device_descriptor *des)
++{
++    return des->idVendor == FNIRSI_DLA32_VID &&
++        des->idProduct == FNIRSI_DLA32_PID;
++}
++
++static int send_command(struct sr_dev_inst *sdi, const uint8_t *command)
++{
++    struct sr_usb_dev_inst *usb = sdi->conn;
++    int transferred;
++    int ret;
++
++    ret = libusb_bulk_transfer(usb->devhdl, FNIRSI_DLA32_EP_OUT,
++        (unsigned char *)command, FNIRSI_DLA32_COMMAND_SIZE,
++        &transferred, 1000);
++    if (ret != 0 || transferred != FNIRSI_DLA32_COMMAND_SIZE) {
++        sr_err("DLA32 command transfer failed: %s (%d/%d).",
++            libusb_error_name(ret), transferred, FNIRSI_DLA32_COMMAND_SIZE);
++        return SR_ERR;
++    }
++
++    return SR_OK;
++}
++
++static void make_setup_command(uint8_t *command)
++{
++    static const uint8_t setup[] = {
++        0x0a, 0x11, 0x1e, 0x00, 0x00, 0x01, 0x00, 0x03,
++        0x00, 0x80, 0xf0, 0xfa, 0x02, 0x08, 0xa0, 0x00,
++        0x02, 0xf4, 0x01, 0x08, 0x0a, 0x00, 0x00, 0x00,
++        0x40, 0x78, 0x7d, 0x01, 0x00, 0x00, 0x00, 0x00,
++        0x0b, 0x43, 0xd6, 0x70, 0xd5,
++    };
++
++    memset(command, 0, FNIRSI_DLA32_COMMAND_SIZE);
++    memcpy(command, setup, sizeof(setup));
++}
++
++static void make_channel_command(uint8_t *command)
++{
++    static const uint8_t channels[] = {
++        0x0a, 0x12, 0x27, 0x00, 0x00, 0xff, 0xff, 0xff,
++        0xff, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
++        0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
++        0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
++        0x00, 0x00, 0x00, 0x00, 0x0b, 0xd6, 0xf9, 0x0a,
++        0x4e,
++    };
++
++    memset(command, 0, FNIRSI_DLA32_COMMAND_SIZE);
++    memcpy(command, channels, sizeof(channels));
++}
++
++static void make_stop_command(uint8_t *command)
++{
++    static const uint8_t stop[] = {
++        0x0a, 0x15, 0x02, 0x00, 0x0b, 0xe6, 0xfc, 0x24,
++        0xd7,
++    };
++
++    memset(command, 0, FNIRSI_DLA32_COMMAND_SIZE);
++    memcpy(command, stop, sizeof(stop));
++}
++
++static GSList *scan(struct sr_dev_driver *di, GSList *options)
++{
++    struct drv_context *drvc = di->context;
++    struct sr_dev_inst *sdi;
++    struct sr_usb_dev_inst *usb;
++    struct sr_channel_group *cg;
++    struct sr_channel *ch;
++    struct sr_config *src;
++    GSList *devices = NULL;
++    GSList *l;
++    const char *conn = NULL;
++    libusb_device **devlist;
++    struct libusb_device_descriptor des;
++    char connection_id[64];
++    int count;
++    int i;
++    int j;
++
++    for (l = options; l; l = l->next) {
++        src = l->data;
++        if (src->key == SR_CONF_CONN)
++            conn = g_variant_get_string(src->data, NULL);
++    }
++
++    count = libusb_get_device_list(drvc->sr_ctx->libusb_ctx, &devlist);
++    if (count < 0)
++        return NULL;
++
++    for (i = 0; i < count; i++) {
++        if (libusb_get_device_descriptor(devlist[i], &des) != 0 ||
++            !is_dla32(&des))
++            continue;
++        if (usb_get_port_path(devlist[i], connection_id,
++            sizeof(connection_id)) < 0)
++            continue;
++        if (conn && strcmp(conn, connection_id) != 0)
++            continue;
++
++        sdi = g_malloc0(sizeof(*sdi));
++        sdi->status = SR_ST_INACTIVE;
++        sdi->inst_type = SR_INST_USB;
++        sdi->vendor = g_strdup("FNIRSI");
++        sdi->model = g_strdup("DLA-32");
++        sdi->connection_id = g_strdup(connection_id);
++        usb = sr_usb_dev_inst_new(libusb_get_bus_number(devlist[i]),
++            libusb_get_device_address(devlist[i]), NULL);
++        sdi->conn = usb;
++        sdi->priv = g_malloc0(sizeof(struct dev_context));
++        ((struct dev_context *)sdi->priv)->samplerate = FNIRSI_DLA32_SAMPLERATE;
++        ((struct dev_context *)sdi->priv)->limit_samples = 0;
++
++        cg = sr_channel_group_new(sdi, "Logic", NULL);
++        for (j = 0; j < 32; j++) {
++            ch = sr_channel_new(sdi, j, SR_CHANNEL_LOGIC, TRUE,
++                channel_names[j]);
++            cg->channels = g_slist_append(cg->channels, ch);
++        }
++        devices = g_slist_append(devices, sdi);
++    }
++
++    libusb_free_device_list(devlist, 1);
++    return std_scan_complete(di, devices);
++}
++
++static int dev_clear(const struct sr_dev_driver *di)
++{
++    return std_dev_clear(di);
++}
++
++static int dev_open(struct sr_dev_inst *sdi)
++{
++    struct drv_context *drvc = sdi->driver->context;
++    struct sr_usb_dev_inst *usb = sdi->conn;
++    libusb_device **devlist;
++    struct libusb_device_descriptor des;
++    int count;
++    int i;
++    int ret = SR_ERR;
++
++    count = libusb_get_device_list(drvc->sr_ctx->libusb_ctx, &devlist);
++    if (count < 0)
++        return SR_ERR;
++    for (i = 0; i < count; i++) {
++        if (libusb_get_device_descriptor(devlist[i], &des) != 0 ||
++            !is_dla32(&des))
++            continue;
++        if (libusb_get_bus_number(devlist[i]) != usb->bus ||
++            libusb_get_device_address(devlist[i]) != usb->address)
++            continue;
++        ret = libusb_open(devlist[i], &usb->devhdl);
++        break;
++    }
++    libusb_free_device_list(devlist, 1);
++    if (ret != 0) {
++        sr_err("Unable to open FNIRSI DLA-32: %s.", libusb_error_name(ret));
++        return SR_ERR;
++    }
++    if (libusb_claim_interface(usb->devhdl, FNIRSI_DLA32_INTERFACE) != 0) {
++        libusb_close(usb->devhdl);
++        usb->devhdl = NULL;
++        return SR_ERR;
++    }
++    return SR_OK;
++}
++
++static int dev_close(struct sr_dev_inst *sdi)
++{
++    struct sr_usb_dev_inst *usb = sdi->conn;
++
++    if (!usb || !usb->devhdl)
++        return SR_ERR;
++    libusb_release_interface(usb->devhdl, FNIRSI_DLA32_INTERFACE);
++    libusb_close(usb->devhdl);
++    usb->devhdl = NULL;
++    return SR_OK;
++}
++
++static int config_get(uint32_t key, GVariant **data,
++    const struct sr_dev_inst *sdi, const struct sr_channel_group *cg)
++{
++    struct dev_context *devc = sdi ? sdi->priv : NULL;
++    struct sr_usb_dev_inst *usb;
++
++    (void)cg;
++    if (!devc)
++        return SR_ERR_ARG;
++    switch (key) {
++    case SR_CONF_CONN:
++        usb = sdi->conn;
++        *data = g_variant_new_printf("%d.%d", usb->bus, usb->address);
++        return SR_OK;
++    case SR_CONF_SAMPLERATE:
++        *data = g_variant_new_uint64(devc->samplerate);
++        return SR_OK;
++    case SR_CONF_LIMIT_SAMPLES:
++        *data = g_variant_new_uint64(devc->limit_samples);
++        return SR_OK;
++    default:
++        return SR_ERR_NA;
++    }
++}
++
++static int config_set(uint32_t key, GVariant *data,
++    const struct sr_dev_inst *sdi, const struct sr_channel_group *cg)
++{
++    struct dev_context *devc = sdi ? sdi->priv : NULL;
++    uint64_t value;
++
++    (void)cg;
++    if (!devc)
++        return SR_ERR_ARG;
++    value = g_variant_get_uint64(data);
++    switch (key) {
++    case SR_CONF_SAMPLERATE:
++        if (value != FNIRSI_DLA32_SAMPLERATE)
++            return SR_ERR_ARG;
++        devc->samplerate = value;
++        return SR_OK;
++    case SR_CONF_LIMIT_SAMPLES:
++        devc->limit_samples = value;
++        return SR_OK;
++    default:
++        return SR_ERR_NA;
++    }
++}
++
++static int config_list(uint32_t key, GVariant **data,
++    const struct sr_dev_inst *sdi, const struct sr_channel_group *cg)
++{
++    if (key == SR_CONF_SAMPLERATE)
++        *data = std_gvar_samplerates(samplerates, ARRAY_SIZE(samplerates));
++    else
++        return STD_CONFIG_LIST(key, data, sdi, cg, scanopts, drvopts, devopts);
++    return SR_OK;
++}
++
++int fnirsi_dla32_handle_events(int fd, int revents, void *cb_data)
++{
++    struct sr_dev_inst *sdi = cb_data;
++    struct sr_dev_driver *di = sdi->driver;
++    struct drv_context *drvc = di->context;
++    struct dev_context *devc = sdi->priv;
++    struct sr_usb_dev_inst *usb = sdi->conn;
++    uint8_t *buffer;
++    int transferred;
++    int ret;
++    struct sr_datafeed_logic logic;
++    struct sr_datafeed_packet packet;
++
++    (void)fd;
++    (void)revents;
++    if (devc->abort_acquisition)
++        return TRUE;
++    buffer = g_malloc(FNIRSI_DLA32_STREAM_SIZE);
++    ret = libusb_bulk_transfer(usb->devhdl, FNIRSI_DLA32_EP_IN,
++        buffer, FNIRSI_DLA32_STREAM_SIZE, &transferred, 10);
++    if (ret == LIBUSB_ERROR_TIMEOUT)
++        return TRUE;
++    if (ret != 0) {
++        sr_err("DLA32 stream transfer failed: %s.", libusb_error_name(ret));
++        g_free(buffer);
++        sdi->status = SR_ST_STOPPING;
++        return TRUE;
++    }
++    if (transferred > 0) {
++        logic.length = transferred;
++        logic.unitsize = 1;
++        logic.format = LA_CROSS_DATA;
++        logic.data = buffer;
++        packet.type = SR_DF_LOGIC;
++        packet.payload = &logic;
++        sr_session_send(sdi, &packet);
++    }
++    g_free(buffer);
++    if (devc->limit_samples && transferred >= (int)devc->limit_samples)
++        devc->abort_acquisition = TRUE;
++    (void)drvc;
++    return TRUE;
++}
++
++static int dev_acquisition_start(const struct sr_dev_inst *sdi)
++{
++    struct sr_dev_driver *di = sdi->driver;
++    struct drv_context *drvc = di->context;
++    struct dev_context *devc = sdi->priv;
++    uint8_t command[FNIRSI_DLA32_COMMAND_SIZE];
++
++    make_setup_command(command);
++    if (send_command((struct sr_dev_inst *)sdi, command) != SR_OK)
++        return SR_ERR;
++    make_channel_command(command);
++    if (send_command((struct sr_dev_inst *)sdi, command) != SR_OK)
++        return SR_ERR;
++    devc->abort_acquisition = FALSE;
++    std_session_send_df_header(sdi);
++    return usb_source_add(sdi->session, drvc->sr_ctx, 10,
++        fnirsi_dla32_handle_events, (void *)sdi);
++}
++
++static int dev_acquisition_stop(struct sr_dev_inst *sdi)
++{
++    struct sr_dev_driver *di = sdi->driver;
++    struct drv_context *drvc = di->context;
++    struct dev_context *devc = sdi->priv;
++    uint8_t command[FNIRSI_DLA32_COMMAND_SIZE];
++
++    devc->abort_acquisition = TRUE;
++    usb_source_remove(sdi->session, drvc->sr_ctx);
++    make_stop_command(command);
++    send_command(sdi, command);
++    std_session_send_df_end(sdi);
++    return SR_OK;
++}
++
++static struct sr_dev_driver fnirsi_dla32_driver_info = {
++    .name = "fnirsi-dla32",
++    .longname = "FNIRSI DLA-32 (captured USB protocol)",
++    .api_version = 1,
++    .init = std_init,
++    .cleanup = std_cleanup,
++    .scan = scan,
++    .dev_list = std_dev_list,
++    .dev_clear = dev_clear,
++    .config_get = config_get,
++    .config_set = config_set,
++    .config_list = config_list,
++    .dev_open = dev_open,
++    .dev_close = dev_close,
++    .dev_acquisition_start = dev_acquisition_start,
++    .dev_acquisition_stop = dev_acquisition_stop,
++    .context = NULL,
++};
++
++SR_REGISTER_DEV_DRIVER(fnirsi_dla32_driver_info);
