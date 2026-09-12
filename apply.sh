@@ -1,4 +1,7 @@
 #!/bin/sh
+# AI-generated with assistance from GitHub Copilot.
+# Model: GitHub Copilot; the underlying model identifier was not exposed.
+# Human review and hardware validation were performed for this integration.
 set -eu
 
 SCRIPT_DIR=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
